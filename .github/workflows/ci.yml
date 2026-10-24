@@ -1,4 +1,4 @@
-name: CI
+name: CI/CD
 
 on:
   pull_request:
@@ -14,14 +14,103 @@ jobs:
     runs-on: ubuntu-latest
     timeout-minutes: 10
     steps:
-      - name: Checkout code
-        uses: actions/checkout@v4
-
-      - name: Set up Node.js
-        uses: actions/setup-node@v4
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
         with:
           node-version: 20
+          cache: npm
+      - run: npm ci
+      - run: npm test
+      - name: Dependency scan
+        run: npm audit --audit-level=high
 
-      - name: Run tests
-        run: npm test
+  package:
+    needs: test
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    outputs:
+      version: ${{ steps.version.outputs.version }}
+    steps:
+      - uses: actions/checkout@v4
+      - name: Compute version
+        id: version
+        run: |
+          VERSION="$(node -p "require('./package.json').version")-${GITHUB_SHA::7}"
+          echo "version=$VERSION" >> "$GITHUB_OUTPUT"
+      - name: Build package
+        env:
+          VERSION: ${{ steps.version.outputs.version }}
+        run: |
+          mkdir -p dist out
+          cp public/index.html src/calculator.js dist/
+          echo "{\"version\":\"$VERSION\",\"commit\":\"$GITHUB_SHA\"}" > dist/version.json
+          (cd dist && zip -r "../out/calculator-web-$VERSION.zip" .)
+          (cd out && sha256sum "calculator-web-$VERSION.zip" > "calculator-web-$VERSION.zip.sha256")
+      - uses: actions/upload-artifact@v4
+        with:
+          name: calculator-web
+          path: out/
+          retention-days: 14
 
+  deploy-dev:
+    needs: package
+    if: github.event_name == 'push' && github.ref == 'refs/heads/main'
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    environment: dev
+    concurrency:
+      group: deploy-dev
+      cancel-in-progress: false
+    permissions:
+      id-token: write
+      contents: read
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          name: calculator-web
+          path: artifact
+      - name: Verify checksum
+        run: cd artifact && sha256sum -c *.sha256
+      - uses: aws-actions/configure-aws-credentials@v4
+        with:
+          role-to-assume: ${{ vars.AWS_ROLE_ARN }}
+          aws-region: ap-south-1
+      - name: Deploy
+        run: |
+          unzip -q artifact/*.zip -d site
+          aws s3 sync site/ "s3://${{ vars.S3_BUCKET }}/" --delete
+      - name: Smoke test
+        env:
+          VERSION: ${{ needs.package.outputs.version }}
+        run: aws s3 cp "s3://${{ vars.S3_BUCKET }}/version.json" - | grep "$VERSION"
+
+  deploy-prod:
+    needs: [package, deploy-dev]
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    environment: prod
+    concurrency:
+      group: deploy-prod
+      cancel-in-progress: false
+    permissions:
+      id-token: write
+      contents: read
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          name: calculator-web
+          path: artifact
+      - name: Verify checksum
+        run: cd artifact && sha256sum -c *.sha256
+      - uses: aws-actions/configure-aws-credentials@v4
+        with:
+          role-to-assume: ${{ vars.AWS_ROLE_ARN }}
+          aws-region: ap-south-1
+      - name: Deploy
+        run: |
+          unzip -q artifact/*.zip -d site
+          aws s3 sync site/ "s3://${{ vars.S3_BUCKET }}/" --delete
+      - name: Smoke test
+        env:
+          VERSION: ${{ needs.package.outputs.version }}
+        run: aws s3 cp "s3://${{ vars.S3_BUCKET }}/version.json" - | grep "$VERSION"
